@@ -72,37 +72,62 @@ class Ledger:
             ):
         '''
         Record the transfer and update both balances in one transaction.
-        Commit all changes together, or roll them all back on failure.
+
+        The balances table is locked for the duration of the transaction so that
+        concurrent transfers cannot overwrite each other's balance updates.
         '''
 
-
         with self.connection.begin():
-            # insert the transaction
-            sql = text(f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount});')
+            # Prevent concurrent transactions from reading or updating balances.
+            sql = text(
+                'LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;'
+            )
             logging.debug(sql)
             self.connection.execute(sql)
 
-            # update the debit account balance
-            sql = text(f'SELECT balance FROM balances WHERE account_id = {debit_account_id};')
+            # Record the transfer.
+            sql = text('''
+                INSERT INTO transactions
+                    (debit_account_id, credit_account_id, amount)
+                VALUES
+                    (:debit_account_id, :credit_account_id, :amount);
+            ''')
             logging.debug(sql)
-            results = self.connection.execute(sql)
-            debit_account_balance = results.first()[0]
+            self.connection.execute(
+                sql,
+                {
+                    'debit_account_id': debit_account_id,
+                    'credit_account_id': credit_account_id,
+                    'amount': amount,
+                }
+            )
 
-            debit_new_balance = debit_account_balance - amount
-            sql = text(f'UPDATE balances SET balance={debit_new_balance} WHERE account_id = {debit_account_id};')
+            # Debit the source account.
+            sql = text('''
+                UPDATE balances
+                SET balance = balance - :amount
+                WHERE account_id = :account_id;
+            ''')
             logging.debug(sql)
-            self.connection.execute(sql)
+            self.connection.execute(
+                sql,
+                {
+                    'amount': amount,
+                    'account_id': debit_account_id,
+                }
+            )
 
-            # FIXME:
-            # you need to update the credit account balance as well
-
-                    # update the credit account balance
-            sql = text(f'SELECT balance FROM balances WHERE account_id = {credit_account_id};')
+            # Credit the destination account.
+            sql = text('''
+                UPDATE balances
+                SET balance = balance + :amount
+                WHERE account_id = :account_id;
+            ''')
             logging.debug(sql)
-            results = self.connection.execute(sql)
-            credit_account_balance = results.first()[0]
-
-            credit_new_balance = credit_account_balance + amount
-            sql = text(f'UPDATE balances SET balance={credit_new_balance} WHERE account_id = {credit_account_id};')
-            logging.debug(sql)
-            self.connection.execute(sql)
+            self.connection.execute(
+                sql,
+                {
+                    'amount': amount,
+                    'account_id': credit_account_id,
+                }
+            )

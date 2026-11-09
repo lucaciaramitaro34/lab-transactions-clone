@@ -4,7 +4,7 @@ services:
   pg:
     build: services/pg
     ports:
-      - 1109:5432
+      - 6767:5432
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=pass
