@@ -3,7 +3,7 @@ from sqlalchemy.sql import text
 import os
 import logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.WARNING,
     format=f'%(asctime)s.%(msecs)03d - {os.getpid()} - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
@@ -65,69 +65,117 @@ class Ledger:
             self.connection.execute(sql)
 
     def transfer_funds(
-            self,
-            debit_account_id,
-            credit_account_id,
-            amount
-            ):
+        self,
+        debit_account_id,
+        credit_account_id,
+        amount
+        ):
         '''
         Record the transfer and update both balances in one transaction.
 
-        The balances table is locked for the duration of the transaction so that
-        concurrent transfers cannot overwrite each other's balance updates.
+        Row-level locks are used so concurrent transfers do not overwrite
+        each other's balance updates. If PostgreSQL detects a deadlock,
+        the entire transaction is retried.
         '''
 
-        with self.connection.begin():
-            # Prevent concurrent transactions from reading or updating balances.
-            sql = text(
-                'LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;'
-            )
-            logging.debug(sql)
-            self.connection.execute(sql)
+        while True:
+            try:
+                with self.connection.begin():
 
-            # Record the transfer.
-            sql = text('''
-                INSERT INTO transactions
-                    (debit_account_id, credit_account_id, amount)
-                VALUES
-                    (:debit_account_id, :credit_account_id, :amount);
-            ''')
-            logging.debug(sql)
-            self.connection.execute(
-                sql,
-                {
-                    'debit_account_id': debit_account_id,
-                    'credit_account_id': credit_account_id,
-                    'amount': amount,
-                }
-            )
+                    # Task 3 table-level lock:
+                    # sql = text(
+                    #     'LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;'
+                    # )
+                    # logging.debug(sql)
+                    # self.connection.execute(sql)
 
-            # Debit the source account.
-            sql = text('''
-                UPDATE balances
-                SET balance = balance - :amount
-                WHERE account_id = :account_id;
-            ''')
-            logging.debug(sql)
-            self.connection.execute(
-                sql,
-                {
-                    'amount': amount,
-                    'account_id': debit_account_id,
-                }
-            )
+                    # Record the transfer.
+                    sql = text('''
+                        INSERT INTO transactions
+                            (debit_account_id, credit_account_id, amount)
+                        VALUES
+                            (:debit_account_id, :credit_account_id, :amount);
+                    ''')
+                    logging.debug(sql)
+                    self.connection.execute(
+                        sql,
+                        {
+                            'debit_account_id': debit_account_id,
+                            'credit_account_id': credit_account_id,
+                            'amount': amount,
+                        }
+                    )
 
-            # Credit the destination account.
-            sql = text('''
-                UPDATE balances
-                SET balance = balance + :amount
-                WHERE account_id = :account_id;
-            ''')
-            logging.debug(sql)
-            self.connection.execute(
-                sql,
-                {
-                    'amount': amount,
-                    'account_id': credit_account_id,
-                }
-            )
+                    # Lock and read the debit account.
+                    sql = text('''
+                        SELECT balance
+                        FROM balances
+                        WHERE account_id = :account_id
+                        FOR UPDATE;
+                    ''')
+                    logging.debug(sql)
+                    results = self.connection.execute(
+                        sql,
+                        {
+                            'account_id': debit_account_id,
+                        }
+                    )
+                    debit_account_balance = results.first()[0]
+
+                    # Update the debit account.
+                    sql = text('''
+                        UPDATE balances
+                        SET balance = :balance
+                        WHERE account_id = :account_id;
+                    ''')
+                    logging.debug(sql)
+                    self.connection.execute(
+                        sql,
+                        {
+                            'balance': debit_account_balance - amount,
+                            'account_id': debit_account_id,
+                        }
+                    )
+
+                    # Lock and read the credit account.
+                    sql = text('''
+                        SELECT balance
+                        FROM balances
+                        WHERE account_id = :account_id
+                        FOR UPDATE;
+                    ''')
+                    logging.debug(sql)
+                    results = self.connection.execute(
+                        sql,
+                        {
+                            'account_id': credit_account_id,
+                        }
+                    )
+                    credit_account_balance = results.first()[0]
+
+                    # Update the credit account.
+                    sql = text('''
+                        UPDATE balances
+                        SET balance = :balance
+                        WHERE account_id = :account_id;
+                    ''')
+                    logging.debug(sql)
+                    self.connection.execute(
+                        sql,
+                        {
+                            'balance': credit_account_balance + amount,
+                            'account_id': credit_account_id,
+                        }
+                    )
+
+                # If we get here, the transaction completed successfully.
+                break
+
+            except sqlalchemy.exc.OperationalError as e:
+                # PostgreSQL deadlock_detected SQLSTATE
+                if getattr(e.orig, 'sqlstate', None) == '40P01':
+                    logging.warning('Deadlock detected; retrying transfer')
+                    continue
+
+                # Re-raise anything that is not a deadlock.
+                raise
